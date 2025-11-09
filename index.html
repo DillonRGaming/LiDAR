@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AR Room Scanner - Black Background</title>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.169/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.169/examples/jsm/webxr/ARButton.js"></script>
+</head>
+<body style="margin: 0; overflow: hidden;">
+  <script>
+    let container, scene, camera, renderer, referenceSpace;
+    let pointCloudGeometry, pointCloud;
+    const globalPoints = [];  // Accumulate positions (Float32Array for perf)
+    const maxPoints = 100000;  // Limit to avoid slowdown
+
+    container = document.createElement('div');
+    document.body.appendChild(container);
+
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });  // Opaque for hiding camera
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.xr.enabled = true;
+    renderer.setClearColor(new THREE.Color(0x000000), 1.0);  // Black background
+    container.appendChild(renderer.domElement);
+
+    // Point cloud setup
+    pointCloudGeometry = new THREE.BufferGeometry();
+    pointCloudGeometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(maxPoints * 3), 3));
+    const material = new THREE.PointsMaterial({ color: 0xffffff, size: 0.01 });  // White points
+    pointCloud = new THREE.Points(pointCloudGeometry, material);
+    scene.add(pointCloud);
+
+    let pointCount = 0;
+
+    // Start AR button
+    const button = ARButton.createButton(renderer, {
+      requiredFeatures: ['hit-test', 'depth-sensing'],
+      depthSensing: { usages: ['cpu-optimized'], format: 'luminance-alpha' }
+    });
+    document.body.appendChild(button);
+
+    renderer.xr.addEventListener('sessionstart', async () => {
+      referenceSpace = await renderer.xr.getSession().requestReferenceSpace('local');
+    });
+
+    function animate() {
+      renderer.setAnimationLoop(render);
+    }
+
+    function render(timestamp, frame) {
+      if (frame && renderer.xr.isPresenting) {
+        const pose = frame.getViewerPose(referenceSpace);
+        if (pose) {
+          const view = pose.views[0];  // Assuming single view
+          const depthInfo = frame.getDepthInformation(view);
+
+          if (depthInfo) {
+            const { width, height, data, normDepthBufferFromNormViewMatrix } = depthInfo;
+            const intrinsics = view.projectionMatrix;  // For projection
+
+            const newPoints = [];
+            for (let y = 0; y < height; y += 8) {  // Heavy downsample for perf
+              for (let x = 0; x < width; x += 8) {
+                const index = (y * width + x) * 2;
+                const depthRaw = data[index] * 256 + data[index + 1];
+                const depth = depthRaw / 65535 * 10;  // Normalize to meters (adjust scale if needed)
+
+                if (depth > 0 && depth < 5) {  // Filter invalid/far depths
+                  // Unproject to 3D: Normalized device coords
+                  const nx = (x / width) * 2 - 1;
+                  const ny = 1 - (y / height) * 2;  // Flip Y
+                  const clipW = intrinsics[11] * depth + intrinsics[15];  // From projection matrix
+                  const pointClip = new THREE.Vector4(nx * depth, ny * depth, -depth, clipW);
+
+                  // To view space, then world via pose
+                  const invProj = new THREE.Matrix4().copy(view.projectionMatrix).invert();
+                  const pointView = pointClip.applyMatrix4(invProj);
+                  const pointWorld = pointView.applyMatrix4(pose.transform.matrix);
+
+                  newPoints.push(pointWorld.x, pointWorld.y, pointWorld.z);
+                }
+              }
+            }
+
+            // Add to global and update geometry
+            if (newPoints.length > 0 && pointCount + newPoints.length / 3 <= maxPoints) {
+              globalPoints.push(...newPoints);
+              const positions = pointCloudGeometry.attributes.position.array;
+              positions.set(globalPoints, 0);
+              pointCloudGeometry.attributes.position.needsUpdate = true;
+              pointCloudGeometry.setDrawRange(0, globalPoints.length / 3);
+              pointCount += newPoints.length / 3;
+            }
+          }
+
+          renderer.render(scene, camera);
+        }
+      }
+    }
+
+    animate();
+
+    // Optional: Export button (add to HTML)
+    const exportButton = document.createElement('button');
+    exportButton.textContent = 'Export Point Cloud';
+    exportButton.style.position = 'absolute';
+    exportButton.style.bottom = '20px';
+    exportButton.style.left = '20px';
+    exportButton.onclick = () => {
+      // Simple PLY export (implement or use a lib)
+      console.log('Exporting ' + pointCount + ' points...');
+      // e.g., Generate PLY string and download
+    };
+    document.body.appendChild(exportButton);
+  </script>
+</body>
+</html>
